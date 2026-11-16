@@ -6,22 +6,21 @@ Output: data/processed/products_clean.csv
 
 Steps
 -----
-1. Drop fully-null rows and deduplicate on p_id.
-2. Strip HTML from the description.
+1. Drop rows with no name/description and deduplicate on p_id.
+2. Strip HTML (tags become separators), drop stock boilerplate, and sanitise:
+   URLs and instruction-like sentences are removed because scraped text is untrusted.
 3. Parse the stringified p_attributes dict and pull out useful fashion attributes.
-4. Build one composite 'retrieval_text' per product (what we embed).
-5. Keep brand / colour / price / avg_rating as filterable metadata.
+4. Derive filterable fields: category (from the name) and gender.
+5. Build one composite 'retrieval_text' per product (what we embed). Price and
+   rating stay out of it: they are metadata, and numbers add noise to embeddings.
 """
 
 import ast
-import html
-import re
-from pathlib import Path
 
 import pandas as pd
 
-RAW = Path("data/raw/Fashion Dataset.csv")
-OUT = Path("data/processed/products_clean.csv")
+import config
+from textutil import category_of, clean_html, drop_boilerplate, gender_of, sanitize
 
 # p_attributes keys worth surfacing for retrieval (skip noisy/ID-like ones)
 ATTR_KEYS = [
@@ -31,21 +30,6 @@ ATTR_KEYS = [
     "Length", "Bottom Type", "Dupatta", "Shape", "Fit", "Waist Rise",
     "Weave Type", "Ornamentation", "Hemline", "Closure",
 ]
-
-_TAG_RE = re.compile(r"<[^>]+>")
-_WS_RE = re.compile(r"\s+")
-
-
-def clean_html(text: str) -> str:
-    """Strip HTML tags/entities and collapse whitespace."""
-    if not isinstance(text, str):
-        return ""
-    text = text.replace("<br>", " ").replace("<li>", " • ")
-    text = _TAG_RE.sub(" ", text)
-    text = html.unescape(text)
-    text = text.replace("•", "-")        # bullet -> dash for plain text
-    text = _WS_RE.sub(" ", text).strip()
-    return text
 
 
 def parse_attrs(raw) -> dict:
@@ -63,60 +47,40 @@ def parse_attrs(raw) -> dict:
 
 
 def attrs_to_text(attrs: dict) -> str:
-    parts = []
-    for key in ATTR_KEYS:
-        if key in attrs:
-            parts.append(f"{key}: {attrs[key]}")
-    return ". ".join(parts)
+    return ". ".join(f"{key}: {attrs[key]}" for key in ATTR_KEYS if key in attrs)
 
 
 def build_retrieval_text(row) -> str:
-    price = row["price"]
-    price_str = f"₹{int(price)}" if pd.notna(price) else "price N/A"
-    rating = row["avg_rating"]
-    rating_str = f"{float(rating):.1f}/5" if pd.notna(rating) else "unrated"
-
-    header = (
-        f"{row['name']} by {row['brand']}. "
-        f"Colour: {row['colour']}. Price: {price_str}. Rating: {rating_str}."
-    )
-    desc = row["description_clean"]
-    attr_text = row["attr_text"]
-
-    segments = [header]
-    if desc:
-        segments.append(desc)
-    if attr_text:
-        segments.append(attr_text)
+    segments = [f"{row['name']} by {row['brand']}. Category: {row['category']}. Colour: {row['colour']}."]
+    if row["description_clean"]:
+        segments.append(row["description_clean"])
+    if row["attr_text"]:
+        segments.append(row["attr_text"])
     return " ".join(segments)
 
 
-def main() -> None:
-    df = pd.read_csv(RAW)
-    print(f"raw rows: {len(df)}")
+def prepare(raw: pd.DataFrame) -> pd.DataFrame:
+    df = raw.dropna(subset=["name", "description", "p_id"])
+    df = df.drop_duplicates(subset=["p_id"], keep="first").copy()
 
-    # 1. drop rows with no name/description, dedup on product id
-    df = df.dropna(subset=["name", "description"])
-    before = len(df)
-    df = df.drop_duplicates(subset=["p_id"], keep="first")
-    print(f"after dropna + dedup: {len(df)} (removed {before - len(df)} dup p_id)")
-
-    # 2. clean description
-    df["description_clean"] = df["description"].map(clean_html)
-
-    # 3. parse attributes
-    attrs = df["p_attributes"].map(parse_attrs)
-    df["attr_text"] = attrs.map(attrs_to_text)
-
-    # 4. composite retrieval text
+    df["name"] = df["name"].map(lambda s: sanitize(clean_html(s, split_fused=False)))
+    df["brand"] = df["brand"].fillna("Unknown").astype(str).str.strip()
+    df["colour"] = df["colour"].fillna("Unknown").astype(str).str.strip()
+    df["description_clean"] = df["description"].map(lambda s: sanitize(drop_boilerplate(clean_html(s))))
+    df["attr_text"] = df["p_attributes"].map(parse_attrs).map(attrs_to_text).map(sanitize)
+    # Detect the garment from the name without the brand ("MANY FROCKS & ..." is not a frock).
+    df["category"] = [category_of(n[len(b):] if n.lower().startswith(b.lower()) else n)
+                      for n, b in zip(df["name"], df["brand"])]
+    df["gender"] = df["name"].map(gender_of)
     df["retrieval_text"] = df.apply(build_retrieval_text, axis=1)
 
-    # 5. tidy final columns
     out = pd.DataFrame({
-        "product_id": df["p_id"].astype("Int64"),
+        "product_id": df["p_id"].astype("int64"),
         "name": df["name"],
         "brand": df["brand"],
         "colour": df["colour"],
+        "category": df["category"],
+        "gender": df["gender"],
         "price": df["price"],
         "avg_rating": df["avg_rating"],
         "rating_count": df["ratingCount"],
@@ -125,25 +89,24 @@ def main() -> None:
         "attributes": df["attr_text"],
         "retrieval_text": df["retrieval_text"],
     })
+    out = out[out["name"].str.len() > 0]
+    out = out.dropna(subset=["price"])
+    return out.sort_values("product_id").reset_index(drop=True)
 
-    # drop any rows whose retrieval text is too thin to be useful
-    out = out[out["retrieval_text"].str.len() >= 40].reset_index(drop=True)
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(OUT, index=False)
+def main() -> None:
+    raw = pd.read_csv(config.RAW_CSV)
+    print(f"raw rows: {len(raw)}")
+    out = prepare(raw)
+    config.PROCESSED_CSV.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(config.PROCESSED_CSV, index=False)
 
-    # ---- report ----
     rl = out["retrieval_text"].str.len()
-    print(f"\nsaved {len(out)} products -> {OUT}")
-    print(f"retrieval_text length: min {rl.min()}, median {int(rl.median())}, "
-          f"mean {rl.mean():.0f}, max {rl.max()}")
-    print(f"rows with rating: {out['avg_rating'].notna().sum()} "
-          f"({out['avg_rating'].notna().mean()*100:.0f}%)")
-    print(f"unique brands: {out['brand'].nunique()}")
-    print("\n===== 2 sample retrieval_text =====")
-    for t in out["retrieval_text"].head(2):
-        print("-" * 80)
-        print(t[:650])
+    print(f"saved {len(out)} products -> {config.PROCESSED_CSV}")
+    print(f"retrieval_text length: min {rl.min()}, median {int(rl.median())}, max {rl.max()}")
+    print(f"rated: {out['avg_rating'].notna().mean()*100:.0f}% | brands: {out['brand'].nunique()}")
+    print("categories:", out["category"].value_counts().to_dict())
+    print("gender:", out["gender"].replace("", "(unlabelled)").value_counts().to_dict())
 
 
 if __name__ == "__main__":

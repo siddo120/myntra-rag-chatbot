@@ -13,13 +13,17 @@ venv/
 # Raw data -- NOT shipped
 data/raw/
 
-# chroma_db IS shipped: a prebuilt 5k index so the deployed app loads instantly
-# (rebuild-on-boot loops on Streamlit Cloud's free tier). Local full rebuilds
-# with build_index.py simply overwrite it.
+# chroma_db IS shipped: the prebuilt index for the full catalogue, so the deployed
+# app starts without embedding anything. The app verifies it against
+# products_clean.csv at startup (hash + row count) and rebuilds it if they differ.
 
-# Ship only products_clean.csv (the 5k subset); keep the full backup local-only
+# Ship only products_clean.csv; keep other processed files local-only
 data/processed/*
 !data/processed/products_clean.csv
+
+# Evaluation outputs and caches
+eval/results_*.json
+.pytest_cache/
 
 # OS
 .DS_Store

@@ -1,40 +1,46 @@
 # RAG Techniques Used
 
 ## Baseline RAG (mandatory) ✅
-A complete working baseline pipeline:
-embed query → semantic (cosine) retrieval from ChromaDB → grounded `gpt-4o-mini`
-answer with an "insufficient context" fallback. See [PIPELINE.md](PIPELINE.md).
+Embed the question → cosine search in ChromaDB → grounded answer from the LLM with
+an "insufficient context" fallback. See [PIPELINE.md](PIPELINE.md).
 
-## Enhancement: Hybrid RAG (optional) ✅
-We combine **semantic (vector) retrieval** with **keyword retrieval (BM25)** and
-merge the results — the first optional enhancement listed in the assignment.
+## Enhancement 1: Hybrid RAG ✅
+Semantic retrieval and BM25 keyword retrieval, merged with **weighted Reciprocal
+Rank Fusion** (`rag.search`, `rag.rrf_fuse`):
 
-**How it works (`src/rag.py`, `retrieve_hybrid`):**
-1. **Semantic search** — OpenAI query embedding → ChromaDB cosine search returns
-   up to 20 candidates (matches *meaning*).
-2. **Keyword search** — `rank_bm25.BM25Okapi` scores the same 14,223-product
-   corpus by exact term overlap and returns up to 20 candidates (matches *exact
-   words* like brand names and fabrics).
-3. **Fusion** — the two ranked lists are merged with **Reciprocal Rank Fusion**:
-   `score(doc) = Σ 1 / (k + rank)` over both lists (k = 60). RRF needs no score
-   normalisation, so it robustly combines ChromaDB distances and BM25 scores,
-   which live on completely different scales.
-4. The top-k fused products go to the LLM.
+`score(doc) = Σ weight_r / (60 + rank_r(doc))`, semantic weight 1.0, keyword 0.6.
 
-**Why it helps:** pure semantic search can under-rank exact terms. Example — the
-query *"Do you have a Biba anarkali kurta?"* returns **only genuine Biba products**
-in hybrid mode, each tagged **both** (semantic *and* keyword agreed), because BM25
-locks onto the literal token "Biba" while the vector search keeps the results
-meaning-relevant.
+- **Semantic** matches meaning ("something warm with a hood" → hooded sweatshirts).
+- **BM25** matches exact words: fabrics and techniques such as *chanderi*,
+  *chikankari*, *gotta patti*. The tokeniser stems plurals and drops stopwords, and
+  the product name is weighted double.
+- Both retrievers run **inside the same metadata filters**, so the fusion only ever
+  ranks products that satisfy the user's hard constraints.
 
-**Metadata filtering** (price/colour) is a complementary mechanism also wired in
-(`retrieve(..., price_max=, colour=)`), exposed via the Streamlit sidebar. It
-enforces *hard* constraints, which neither semantic nor keyword ranking does on
-its own.
+The Streamlit toggle switches hybrid off to show the difference live.
 
-## Not yet implemented (future work)
-- **Query decomposition** — splitting multi-part questions ("red kurta under 3000
-  *and* a matching dupatta") into sub-queries, retrieving for each, then combining.
-  Would fix Failure case 2 in [TESTING.md](TESTING.md).
-- **Query understanding** — parsing price/colour/occasion out of free text into
-  the existing metadata filters.
+## Enhancement 2: Query decomposition ✅
+For a multi-part question, one small LLM call returns self-contained sub-queries
+(`rag.understand`). Each sub-query is parsed, filtered and retrieved on its own,
+and the evidence is presented to the answer model in labelled groups.
+
+> "I need a red festive kurta under 3000 and a matching dupatta"
+> → `red festive kurta under 3000` (category Kurta, colour Red, price ≤ 3000)
+> → `red dupatta` (category Dupatta, colour Red)
+
+The same call resolves follow-ups ("which of those is the cheapest?") into a
+standalone question using the chat history. It is skipped for simple first
+questions, so most turns cost one LLM call.
+
+## Supporting techniques
+- **Self-querying filters**: price, colour family, brand, category and gender are
+  extracted from the text and applied as metadata filters (deterministic code, unit
+  tested, no LLM).
+- **Metadata aggregation**: "cheapest" and "best rated" sort on metadata rather
+  than relying on top-k similarity.
+- **Grounding checks**: numbered citations, a price validator, and evidence passed
+  as untrusted data.
+
+## Not implemented (future work)
+- A cross-encoder reranker. The benchmark does not yet show a need for one.
+- A policy/FAQ corpus for returns and delivery questions.
